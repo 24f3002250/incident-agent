@@ -555,6 +555,23 @@ async def read_json(request):
 
 
 REQ_LOG = []   # (time, method, path-shape, status, ms) - no bodies, no secrets
+CAPTURE = []   # recent grader exchanges for offline debugging; `sensitive` is never stored
+CAPTURE_PATH = "/debug/capture-7f3k9q2x"
+
+
+def capture(kind, run_id, headers, body, status, resp):
+    try:
+        b = copy.deepcopy(body) if isinstance(body, dict) else body
+        if isinstance(b, dict) and "sensitive" in b:
+            b["sensitive"] = "[omitted]"
+        h = {k: v for k, v in headers.items() if k.lower() in (
+            "traceparent", "tracestate", "content-type", "user-agent", "baggage")}
+        h["_headerNames"] = sorted(headers.keys())
+        CAPTURE.append({"at": time.strftime("%H:%M:%S"), "kind": kind, "runId": run_id,
+                        "headers": h, "body": b, "status": status, "response": resp})
+        del CAPTURE[:-60]
+    except Exception:
+        pass
 RUN_LOG = []   # per-run planning summary - no transcript, no arguments
 
 
@@ -568,6 +585,11 @@ async def log_requests(request: Request, call_next):
     del REQ_LOG[:-80]
     print("REQ", REQ_LOG[-1], flush=True)
     return resp
+
+
+@app.get(CAPTURE_PATH)
+async def debug_capture():
+    return {"captures": CAPTURE}
 
 
 @app.get("/debug")
@@ -607,6 +629,10 @@ async def create_incident(request: Request):
         return e
     problem = validate_incident_body(body)
     if problem:
+        capture("create-invalid", body.get("runId") if isinstance(body, dict) else None,
+                request.headers, {"keys": sorted(body) if isinstance(body, dict) else None,
+                                  "profile": body.get("profile") if isinstance(body, dict) else None},
+                422, {"error": problem})
         return err(422 if isinstance(body, dict) else 400, problem)
     run_id = body["runId"]
     h = body_hash(body)
@@ -614,7 +640,9 @@ async def create_incident(request: Request):
         existing = db_get_run(run_id)
         if existing:
             if existing["body_hash"] != h:
+                capture("create-conflict", run_id, request.headers, {"keys": sorted(body)}, 409, None)
                 return err(409, "runId already exists with different content")
+            capture("create-replay", run_id, request.headers, {"keys": sorted(body)}, 200, None)
             return JSONResponse(existing["initial_response"])
 
         # incoming trace context (header first, then body)
@@ -688,6 +716,7 @@ async def create_incident(request: Request):
         })
         del RUN_LOG[:-60]
         print("RUN", json.dumps(RUN_LOG[-1]), flush=True)
+        capture("create", run_id, request.headers, body, 200, resp)
         return JSONResponse(resp)
 
 
@@ -714,9 +743,12 @@ async def post_receipt(run_id: str, request: Request):
         try:
             new_state = process_receipt(run["state"], body)
         except ValueError as ex:
+            capture("receipt-invalid", run_id, request.headers, body, 422, {"error": str(ex)})
             return err(422, f"invalid state change: {ex}")
         resp = view(new_state)
         db_apply_receipt(run_id, rid, h, resp, new_state)
+        capture("receipt", run_id, request.headers, body, 200, {"status": resp["status"],
+                "dispatches": resp["dispatches"], "approvals": resp["approvals"]})
         return JSONResponse(resp)
 
 
