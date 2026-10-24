@@ -521,32 +521,27 @@ def process_receipt(st, body):
 
 # ---------------------------------------------------------------- views
 def view(st):
-    """Waiting responses carry exactly the documented proposal fields; final responses
-    carry the full audit record (with empty dispatches/approvals)."""
-    if st["status"] == "waiting":
-        out = {
-            "runId": st["runId"],
-            "status": "waiting",
-            "diagnosis": copy.deepcopy(st["diagnosis"]),
-            "dispatches": [copy.deepcopy(at["dispatch"]) for _, at in pending_attempts(st)],
-            "approvals": [
-                {k: ap[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}
-                for ap in st["approvals"] if ap["decision"] is None
-            ],
-        }
+    waiting = st["status"] == "waiting"
+    out = {
+        "runId": st["runId"],
+        "status": st["status"],
+        "diagnosis": copy.deepcopy(st["diagnosis"]),
+    }
+    if waiting:
+        out["dispatches"] = [copy.deepcopy(at["dispatch"]) for _, at in pending_attempts(st)]
+        out["approvals"] = [
+            {k: ap[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}
+            for ap in st["approvals"] if ap["decision"] is None
+        ]
+        out["chosenEffect"] = st.get("chosenEffect")
     else:
-        out = {
-            "runId": st["runId"],
-            "status": st["status"],
-            "diagnosis": copy.deepcopy(st["diagnosis"]),
-            "chosenEffect": st.get("chosenEffect") or st["plan"]["effect"]["toolName"],
-            "suppressed": [x["toolName"] for x in st["suppressed"]],
-            "actionLog": copy.deepcopy(st["actionLog"]),
-            "receiptLog": copy.deepcopy(st["receiptLog"]),
-            "otlp": build_otlp(st),
-            "dispatches": [],
-            "approvals": [],
-        }
+        out["dispatches"] = []
+        out["approvals"] = []
+        out["chosenEffect"] = st.get("chosenEffect") or st["plan"]["effect"]["toolName"]
+    out["suppressed"] = [x["toolName"] for x in st["suppressed"]]
+    out["actionLog"] = copy.deepcopy(st["actionLog"])
+    out["receiptLog"] = copy.deepcopy(st["receiptLog"])
+    out["otlp"] = build_otlp(st)
     return scrub(out, st.get("scrubList", []))
 
 
