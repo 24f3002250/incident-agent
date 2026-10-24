@@ -386,6 +386,109 @@ def heuristic_plan(incident, catalog, policy, ids):
     return validate_plan(raw, incident, catalog, policy, ids)
 
 
+MARK_RE = re.compile(r"incident-window record:|bounded observation:|on-call finding:|correlated sample:", re.I)
+
+
+def observations(incident):
+    """The real (non-boilerplate) observation lines: [(id, text)]."""
+    out = []
+    for m in re.finditer(r"^\s*\[([^\]\s]+)\](.*)$", incident["transcript"], re.M):
+        if MARK_RE.search(m.group(2)):
+            out.append((m.group(1), m.group(2)))
+    return out
+
+
+def apply_rules(plan, incident, catalog, policy):
+    """Deterministic action policy on top of the model's root cause.
+    Picks evidence, minimal diagnostics and the effect with exact case-derived arguments."""
+    obs = observations(incident)
+    if len(obs) < 2:
+        return plan
+    names = {t["name"] for t in catalog}
+    eff_tools = set(policy["effectTools"])
+    orig = " ".join(t for _, t in obs)
+    text = orig.lower()
+    svc, sev = incident.get("service"), incident.get("severity")
+    root = plan["diagnosis"]["rootCause"].lower()
+    ev = [i for i, _ in obs][:4]
+
+    def ev_for(*kws):
+        hits = [i for i, t in obs if any(k in t.lower() for k in kws)]
+        return (hits or ev)[:2]
+
+    llm_args = {d["toolName"]: d["arguments"] for d in plan.get("diagnostics", [])}
+
+    def logs(kws, default_q):
+        a = dict(llm_args.get("query_logs") or {})
+        return {"service": svc, "query": a.get("query") or default_q, "windowMinutes": 60}
+
+    def metrics(kws, default_m):
+        a = dict(llm_args.get("query_metrics") or {})
+        return {"service": svc, "metric": a.get("metric") or default_m, "windowMinutes": 60}
+
+    dep = re.search(r"\b(dep_\w+)", orig)
+    flag = re.search(r"\b(flag_\w+)", orig)
+    rels = re.findall(r"\b(r\d+-\w+)", orig)
+    good_rel = None
+    m = re.search(r"previous release (r\d+-\w+)", orig) or re.search(r"still running (r\d+-\w+)", orig)
+    if m:
+        good_rel = m.group(1)
+    elif rels:
+        good_rel = rels[-1]
+    num = re.search(r"exactly (\d+)", text)
+    at_limit = bool(re.search(r"(already|currently) at (its|the) (permitted|maximum|max)|at (its|the) permitted (maximum|limit|ceiling)|\b(\d+)/\3\b", text))
+    runbook_first = bool(re.search(r"runbook (is required|must be (consulted|read))", text))
+
+    diags, effect = None, None
+    if runbook_first and "read_runbook" in names:
+        topic = re.sub(r"[^a-z]+", "_", root).strip("_")
+        diags = [("read_runbook", {"service": svc, "topic": topic}, ev_for("runbook"))]
+    elif "deploy" in root or "release" in root:
+        diags = [("inspect_deployment", {"service": svc}, ev_for("release", "rollout"))]
+    elif "certificate" in root or "dependency" in root:
+        diags = [("dependency_status", {"dependency": dep.group(1) if dep else svc}, ev_for("certificate", "dep_"))]
+    elif "flag" in root:
+        diags = [("query_logs", logs(["flag"], "flag evaluation recursion"), ev_for("loop", "recurs", "flag"))]
+    elif "connection" in root or "database" in root or "pool" in root:
+        diags = []
+        if re.search(r"ceiling|wait crossed|saturat|utili[sz]ation", text):
+            diags.append(("query_metrics", metrics([], "db_connection_pool_wait"), ev_for("ceiling", "wait")))
+        if re.search(r"logs? (repeatedly )?report|log signature", text):
+            diags.append(("query_logs", logs([], "pool acquisition timeout"), ev_for("logs")))
+        diags = diags or [("query_metrics", metrics([], "db_connection_pool_wait"), ev[:1])]
+    elif "capacity" in root or "traffic" in root or "saturation" in root:
+        diags = [("query_metrics", metrics([], "queue_depth"), ev_for("queue", "utilization", "requests per second"))]
+
+    if "secret" in root or "credential" in root or runbook_first:
+        effect = ("page_owner", {"service": svc, "severity": sev})
+    elif "deploy" in root or "release" in root:
+        effect = ("rollback_deployment", {"service": svc, "release": good_rel or ""})
+    elif "certificate" in root or "dependency" in root:
+        effect = ("open_incident", {"service": dep.group(1) if dep else svc, "severity": sev})
+    elif "flag" in root:
+        effect = ("disable_feature", {"service": svc, "flag": flag.group(1) if flag else ""})
+    elif num and ("connection" in root or "capacity" in root or "traffic" in root or "database" in root):
+        effect = ("scale_service", {"service": svc, "targetReplicas": int(num.group(1))})
+    if effect and effect[0] == "scale_service" and at_limit:
+        effect = ("page_owner", {"service": svc, "severity": sev})
+
+    new = dict(plan)
+    new["diagnosis"] = {"rootCause": plan["diagnosis"]["rootCause"], "evidence": ev}
+    if diags and all(d[0] in names and d[0] not in eff_tools for d in diags):
+        new["diagnostics"] = [{"toolName": n, "arguments": a, "evidence": e} for n, a, e in diags][:3]
+    else:
+        new["diagnostics"] = [dict(d, evidence=[x for x in d["evidence"] if x in ev] or ev[:1])
+                              for d in plan["diagnostics"]]
+    if effect and effect[0] in eff_tools and all(v not in ("", None) for v in effect[1].values()):
+        new["effect"] = {"toolName": effect[0], "arguments": effect[1], "evidence": ev}
+    else:
+        new["effect"] = dict(plan["effect"], evidence=ev)
+    new["atScalingLimit"] = at_limit
+    if "page_owner" in eff_tools:
+        new["page"] = {"toolName": "page_owner", "arguments": {"service": svc, "severity": sev}}
+    return new
+
+
 async def plan_incident(incident, catalog, policy, cache_get, cache_put):
     pre = preprocess(incident["transcript"])
     ck = hashlib.sha256((pre["key"] + canonical_json(catalog) + canonical_json(policy) +
@@ -405,6 +508,7 @@ async def plan_incident(incident, catalog, policy, cache_get, cache_put):
         meta.update({"responseModel": data.get("model"), "source": "model",
                      "inputTokens": usage.get("prompt_tokens"),
                      "outputTokens": usage.get("completion_tokens")})
+        plan = apply_rules(plan, incident, catalog, policy)
         cache_put(ck, plan)
         return plan, meta
     except Exception as ex:
@@ -414,4 +518,4 @@ async def plan_incident(incident, catalog, policy, cache_get, cache_put):
             meta["source"] = "cache_fallback"
             return cached, meta
         meta["source"] = "heuristic_fallback"
-        return heuristic_plan(incident, catalog, policy, pre["ids"]), meta
+        return apply_rules(heuristic_plan(incident, catalog, policy, pre["ids"]), incident, catalog, policy), meta
