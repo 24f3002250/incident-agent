@@ -100,36 +100,53 @@ def build_messages(incident, catalog, policy):
     return [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}]
 
 
-async def call_llm(messages, deadline):
+LLM_FALLBACK_MODELS = [m.strip() for m in os.environ.get(
+    "LLM_FALLBACK_MODELS", "gpt-4o-mini,gpt-4.1-nano").split(",") if m.strip()]
+LAST_LLM_ERRORS = []  # recent error strings for /debug (never contain the key)
+
+
+def _note_error(msg):
+    LAST_LLM_ERRORS.append(f"{time.strftime('%H:%M:%S')} {msg}")
+    del LAST_LLM_ERRORS[:-20]
+    print("LLM ERROR:", msg, flush=True)
+
+
+async def call_llm(messages, deadline, max_tokens=1200, json_mode=True):
     key = _api_key()
     if not key:
+        _note_error("no_api_key (set AIPIPE_TOKEN env var)")
         raise RuntimeError("no_api_key")
-    payload = {"model": LLM_MODEL, "messages": messages, "temperature": 0,
-               "response_format": {"type": "json_object"}, "max_tokens": 1200}
-    last_exc = None
+    models = [LLM_MODEL] + [m for m in LLM_FALLBACK_MODELS if m != LLM_MODEL]
+    last_err = "llm_failed"
     async with httpx.AsyncClient() as client:
-        for _ in range(2):
+        for model in models:
             remaining = deadline - time.monotonic()
             if remaining < 2:
                 break
+            payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
+            if json_mode:
+                payload["response_format"] = {"type": "json_object"}
             try:
                 r = await client.post(f"{LLM_BASE_URL}/chat/completions", json=payload,
                                       headers={"Authorization": f"Bearer {key}"}, timeout=remaining)
-                if r.status_code >= 500 or r.status_code == 429:
-                    last_exc = RuntimeError(f"llm_http_{r.status_code}")
-                    await asyncio.sleep(0.3)
+                if r.status_code != 200:
+                    body = r.text[:300].replace(key, "[REDACTED]")
+                    last_err = f"llm_http_{r.status_code}"
+                    _note_error(f"{model} HTTP {r.status_code}: {body}")
                     continue
-                r.raise_for_status()
                 data = r.json()
-                text = data["choices"][0]["message"]["content"]
+                text = data["choices"][0]["message"]["content"] or ""
+                if not json_mode:
+                    return text, data
                 m = re.search(r"\{.*\}", text, re.S)
                 return json.loads(m.group(0) if m else text), data
-            except (httpx.TimeoutException, httpx.TransportError) as ex:
-                last_exc = ex
-            except Exception as ex:  # malformed JSON etc.
-                last_exc = ex
-                break
-    raise RuntimeError(type(last_exc).__name__ if last_exc else "llm_failed")
+            except httpx.TimeoutException:
+                last_err = "llm_timeout"
+                _note_error(f"{model} timeout after {remaining:.1f}s")
+            except Exception as ex:
+                last_err = type(ex).__name__
+                _note_error(f"{model} {type(ex).__name__}: {str(ex)[:200]}")
+    raise RuntimeError(last_err)
 
 
 # ------------------------------------------------------------- validation
@@ -313,8 +330,14 @@ async def plan_incident(incident, catalog, policy, cache_get, cache_put):
     deadline = time.monotonic() + LLM_TIMEOUT
     try:
         raw, data = await call_llm(build_messages(incident, catalog, policy), deadline)
-        plan = validate_plan(raw, incident, catalog, policy, pre["ids"])
+        try:
+            plan = validate_plan(raw, incident, catalog, policy, pre["ids"])
+        except Exception as ex:
+            _note_error(f"plan validation failed: {ex}; raw keys={list(raw)[:8]}")
+            raise
         usage = data.get("usage") or {}
+        if data.get("model"):
+            meta["model"] = data.get("model")
         meta.update({"responseModel": data.get("model"), "source": "model",
                      "inputTokens": usage.get("prompt_tokens"),
                      "outputTokens": usage.get("completion_tokens")})

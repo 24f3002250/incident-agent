@@ -554,6 +554,45 @@ async def read_json(request):
         return None, err(400, "invalid JSON")
 
 
+REQ_LOG = []   # (time, method, path-shape, status, ms) - no bodies, no secrets
+RUN_LOG = []   # per-run planning summary - no transcript, no arguments
+
+
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    t = time.monotonic()
+    resp = await call_next(request)
+    ms = int((time.monotonic() - t) * 1000)
+    path = re.sub(r"/v2/incidents/[^/]+", "/v2/incidents/{runId}", request.url.path)
+    REQ_LOG.append(f"{time.strftime('%H:%M:%S')} {request.method} {path} -> {resp.status_code} {ms}ms")
+    del REQ_LOG[:-80]
+    print("REQ", REQ_LOG[-1], flush=True)
+    return resp
+
+
+@app.get("/debug")
+async def debug():
+    import planner as P
+    return {"tokenConfigured": bool(P._api_key()), "model": P.LLM_MODEL,
+            "fallbackModels": P.LLM_FALLBACK_MODELS, "baseUrl": P.LLM_BASE_URL,
+            "recentRuns": RUN_LOG[-30:], "recentLlmErrors": P.LAST_LLM_ERRORS[-20:],
+            "recentRequests": REQ_LOG[-80:]}
+
+
+@app.get("/debug/ping-llm")
+async def ping_llm():
+    import planner as P
+    t = time.monotonic()
+    try:
+        text, data = await P.call_llm([{"role": "user", "content": "Reply with the word ok"}],
+                                      time.monotonic() + 15, max_tokens=5, json_mode=False)
+        return {"ok": True, "model": data.get("model"), "reply": text[:20],
+                "ms": int((time.monotonic() - t) * 1000)}
+    except Exception as ex:
+        return {"ok": False, "error": str(ex), "ms": int((time.monotonic() - t) * 1000),
+                "details": P.LAST_LLM_ERRORS[-3:]}
+
+
 @app.get("/")
 async def root():
     return {"ok": True, "profile": PROFILE, "routes": ["POST /v2/incidents",
@@ -636,6 +675,19 @@ async def create_incident(request: Request):
         st["respondedAt"] = now_ns()
         resp = view(st)
         db_put_run(run_id, h, resp, st)
+        RUN_LOG.append({
+            "at": time.strftime("%H:%M:%S"), "run": run_id[-8:],
+            "incident": str(body["incident"].get("incidentId", ""))[:40],
+            "source": model_meta.get("source"), "model": model_meta.get("model"),
+            "error": model_meta.get("error"), "llmMs": (chat_end - chat_start) // 1_000_000,
+            "totalMs": (now_ns() - received_at) // 1_000_000,
+            "rootCause": plan["diagnosis"]["rootCause"],
+            "diagnosticTools": [d["toolName"] for d in plan["diagnostics"]],
+            "effectTool": plan["effect"]["toolName"],
+            "transcriptChars": len(body["incident"]["transcript"]),
+        })
+        del RUN_LOG[:-60]
+        print("RUN", json.dumps(RUN_LOG[-1]), flush=True)
         return JSONResponse(resp)
 
 
