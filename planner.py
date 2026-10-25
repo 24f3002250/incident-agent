@@ -15,7 +15,7 @@ import httpx
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "https://aipipe.org/openai/v1").rstrip("/")
 LLM_MODEL = os.environ.get("LLM_MODEL", "gpt-4.1-mini")
 LLM_PROVIDER = os.environ.get("LLM_PROVIDER", "openai")
-LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "13.5"))
+LLM_TIMEOUT = float(os.environ.get("LLM_TIMEOUT", "9"))
 
 
 def _api_key():
@@ -139,7 +139,7 @@ async def call_llm(messages, deadline, max_tokens=1200, json_mode=True):
     async with httpx.AsyncClient() as client:
         for model in models:
             remaining = deadline - time.monotonic()
-            if remaining < 2:
+            if remaining < 2.5:
                 break
             payload = {"model": model, "messages": messages, "temperature": 0, "max_tokens": max_tokens}
             if json_mode:
